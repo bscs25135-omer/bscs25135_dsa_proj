@@ -26,6 +26,7 @@
 
 #include <iostream>
 #include <string>
+#include <cstring>
 #include <cstdlib>
 #include <thread>
 #include <mutex>
@@ -66,30 +67,36 @@ class Queue
 
 public:
     // Implement these functions:
-    Queue()
-    {
-
-    }
-    ~Queue()
-    {
-
-    }
+    Queue() { front = nullptr; rear = nullptr; count = 0; }
+    ~Queue() {
+        while (front != nullptr) {
+         Node *n = front;
+         front = front->next;
+         delete n; }
+        }
     void enqueue(const T &val)
     {
-
+        Node *n = new Node;
+        n->data = val;
+        n->next = nullptr;
+        if (rear != nullptr) rear->next = n;
+        else front = n;
+        rear = n;
+        count++;
     }
     T dequeue()
     {
-
+        if (front == nullptr) return T();
+        Node *n = front;
+        T v = n->data;
+        front = n->next;
+        if (front == nullptr) rear = nullptr;
+        delete n;
+        count--;
+        return v;
     }
-    bool isEmpty()
-    {
-        
-    }
-    int size()
-    {
-
-    }
+    bool isEmpty() { return count == 0; }
+    int size() { return count; }
 };
 
 struct ClientInfo
@@ -111,12 +118,29 @@ bool sendAll(int sock, const char *buf, size_t n)
 {
     // Reply format: [status: 1 byte][sending_material][checksum: 4 bytes].
     // send() may send fewer bytes than asked for, so keep calling it until all n bytes are sent.
+    size_t sent = 0;
+    while (sent < n)
+    {
+        ssize_t r = send(sock, buf + sent, n - sent, MSG_NOSIGNAL);
+        if (r < 0) { if (errno == EINTR) continue; return false; }
+        if (r == 0) return false;
+        sent = sent + r;
+    }
+    return true;
     
 }
 bool sendError(int sock, const string &message)
 {
     // Reply format: [status: 1 byte][payload until close][checksum: 4 bytes].
-    // For an error: send one byte with value 1, then the message text. 
+    // For an error: send one byte with value 1, then the message text.
+    string out = "";
+    out += (char)1;
+    out += message;
+    uint32_t c = crcOf(out.c_str(), out.size());
+    char t[4];
+    putU32(t, c);
+    for (int i = 0; i < 4; i++) out += t[i];
+    return sendAll(sock, out.c_str(), out.size());
 }
 int createListenSocket(int port)
 { 
@@ -124,11 +148,34 @@ int createListenSocket(int port)
     // set SO_REUSEADDR so we can restart the load balancer right away.
     // bind() to the port on any address, then listen(LISTEN_BACKLOG).
     // If bind or listen fails, print the error and exit, because without this socket we cannot work.
+
+    int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) { perror("socket"); exit(1); }
+    int yes = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+    if (bind(s, (sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); exit(1); }
+    if (listen(s, LISTEN_BACKLOG) < 0) { perror("listen"); exit(1); }
+    return s;
 }
 int connectToServer(const char *host, int port)
 {
     // Create a TCP socket (SOCK_CLOEXEC) and connect it to host:port.
-    // Return the socket, or -1 if the connection fails 
+    // Return the socket, or -1 if the connection fails
+
+    int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) return -1;
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) { close(s); return -1; }  // text IP -> binary
+    if (connect(s, (sockaddr *)&addr, sizeof(addr)) < 0) { close(s); return -1; }
+    return s;
 }
 
 // =============================================================================================
