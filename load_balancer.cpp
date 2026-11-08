@@ -189,6 +189,10 @@ bool startServer(int port)
     //   Example: "./server 5001 &"
     // Call system() with it.
     // Return true if system() returned 0, otherwise false.
+
+    string cmd = string(SERVER_PATH) + " " + to_string(port) + " &";
+    return system(cmd.c_str()) == 0;
+
 }
 int connectToServerWithWakeup()
 {
@@ -196,6 +200,18 @@ int connectToServerWithWakeup()
     // 2. Otherwise call startServer(). If it fails, return -1.
     // 3. Try connectToServer() up to STARTUP_MAX_ATTEMPTS times 
     // 4. Return the first working socket, or -1 if the server never came up.
+
+    int s = connectToServer(serverHost.c_str(), serverPort);
+    if (s >= 0) return s;
+    if (!startServer(serverPort)) return -1;
+    for (int i = 0; i < STARTUP_MAX_ATTEMPTS; i++)
+    {
+        usleep(STARTUP_POLL_INTERVAL_MS * 1000);
+        s = connectToServer(serverHost.c_str(), serverPort);
+        if (s >= 0) return s;
+    }
+    return -1;
+
 }
 
 
