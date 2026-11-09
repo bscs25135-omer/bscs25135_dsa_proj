@@ -39,7 +39,6 @@ int LB_PORT = 5000;
 const int MAX_VARS_PER_FRAME = 16;
 const int MAX_STACK_DEPTH = 64;
 
-
 // ---- Structs (same as Phase 1, so the file can be read back exactly as it was written) ----
 struct Variable
 {
@@ -60,7 +59,7 @@ struct Snapshot
     Frame callStack[MAX_STACK_DEPTH];
     int32_t stackDepth;
 };
-struct TTDBHeader 
+struct TTDBHeader
 {
     char magic[4]; // "TTDB"
     int32_t version;
@@ -77,9 +76,9 @@ struct TdbgReader
 };
 struct DebugSession
 {
-    int active_flag;     // false until a "start" has worked
-    TdbgReader reader;   // the .tdbg file stays open for the whole session
-    int64_t currentStep; 
+    int active_flag;   // false until a "start" has worked
+    TdbgReader reader; // the .tdbg file stays open for the whole session
+    int64_t currentStep;
 };
 
 // =============================================================================================
@@ -90,17 +89,91 @@ bool recvAll(int sock, char *buf, size_t n)
 {
     // recv() can return fewer bytes than asked for, so keep calling it until exactly n bytes are read.
     // Return false if the connection closes or fails before n bytes arrive.
+
+    size_t got = 0;
+    while (got < n)
+    {
+        ssize_t r = recv(sock, buf + got, n - got, 0);
+        if (r <= 0)
+            return false;
+        got = got + r;
+    }
+    return true;
 }
 bool sendAll(int sock, const char *buf, size_t n)
 {
     // send() can send fewer bytes than asked for, so keep calling it until all n bytes are sent.
     // Use the flag MSG_NOSIGNAL. Return false if the connection fails.
+
+    size_t sent = 0;
+    while (sent < n)
+    {
+        ssize_t r = send(sock, buf + sent, n - sent, MSG_NOSIGNAL);
+        if (r <= 0)
+            return false;
+        sent = sent + r;
+    }
+    return true;
+}
+
+bool parseIPv4(const char *text, unsigned char out[4])
+{
+    int part = 0;
+    int value = 0;
+    int digits = 0;
+    for (int i = 0;; i++)
+    {
+        char c = text[i];
+        if (c >= '0' and c <= '9')
+        {
+            value = value * 10 + (c - '0');
+            digits++;
+            if (digits > 3 or value > 255)
+                return false;
+        }
+        else if (c == '.' or c == '\0')
+        {
+            if (digits == 0)
+                return false;
+            if (part >= 4)
+                return false;
+            out[part] = (unsigned char)value;
+            part++;
+            value = 0;
+            digits = 0;
+            if (c == '\0')
+                break;
+        }
+        else
+            return false;
+    }
+    return part == 4;
 }
 
 int connectToHost(const char *host, int port)
 {
     // Create a TCP socket and connect it to host:port.
     // Return the socket, or -1 if the connection fails.
+
+    unsigned char ip[4];
+    if (port < 1 or port > 65535 or !parseIPv4(host, ip))
+        return -1;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0)
+        return -1;
+    sockaddr addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sa_family = AF_INET;
+    addr.sa_data[0] = (char)((port >> 8) & 0xFF);
+    addr.sa_data[1] = (char)(port & 0xFF);
+    for (int i = 0; i < 4; i++)
+        addr.sa_data[2 + i] = (char)ip[i];
+    if (connect(s, &addr, sizeof(addr)) < 0)
+    {
+        close(s);
+        return -1;
+    }
+    return s;
 }
 bool uploadSource(int sock, const char *sourcePath)
 {
@@ -142,7 +215,6 @@ Snapshot *readSnapshotAt(TdbgReader &r, int32_t step)
 
 void initSession(DebugSession &s)
 {
-   
 }
 void closeSession(DebugSession &s)
 {
@@ -177,7 +249,7 @@ bool cmdStart(DebugSession &s, const string &sourcePath)
 bool cmdNext(DebugSession &s) {}
 bool cmdPrv(DebugSession &s) {}
 bool cmdJmpNext(DebugSession &s, int32_t n) {}
-bool cmdJmpPrv(DebugSession &s, int32_t n) { }
+bool cmdJmpPrv(DebugSession &s, int32_t n) {}
 
 // =============================================================================================
 // PART E: PRINTING
@@ -211,7 +283,7 @@ bool runCommand(DebugSession &s, const string &line, bool &quitRequested)
 }
 int main(int argc, char *argv[])
 {
-    // you get string LB_HOST and int LB_PORT = 0 in arguments of this main function. 
+    // you get string LB_HOST and int LB_PORT = 0 in arguments of this main function.
 
     // DebugSession session; initSession(session);
     // Print a short welcome and the help text.
@@ -221,5 +293,4 @@ int main(int argc, char *argv[])
     //
     // After the loop: closeSession(session) and return 0.
     // Never exit the loop because of an error. Only quit or the end of the input leaves it.
-
 }
