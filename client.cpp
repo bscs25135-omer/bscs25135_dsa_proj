@@ -636,6 +636,43 @@ void printHelp()
 // PART F: THE INFINITE LOOP
 // =============================================================================================
 
+vector<string> splitWords(const string &line)
+{
+    vector<string> words;
+    int32_t i = 0, n = (int32_t)line.size();
+    while (i < n)
+    {
+        while (i < n and (line[i] == ' ' or line[i] == '\t' or line[i] == '\r'))
+            i++;
+        if (i >= n)
+            break;
+        string w = "";
+        while (i < n and line[i] != ' ' and line[i] != '\t' and line[i] != '\r')
+        {
+            w += line[i];
+            i++;
+        }
+        words.push_back(w);
+    }
+    return words;
+}
+bool parseJump(const string &s, int32_t &out)
+{
+    if (s.size() == 0 or s.size() > 10)
+        return false;
+    int64_t v = 0;
+    for (int32_t i = 0; i < (int32_t)s.size(); i++)
+    {
+        if (s[i] < '0' or s[i] > '9')
+            return false;
+        v = v * 10 + (s[i] - '0');
+    }
+    if (v < 1 or v > MAX_JUMP)
+        return false;
+    out = (int32_t)v;
+    return true;
+}
+
 bool runCommand(DebugSession &s, const string &line, bool &quitRequested)
 {
     // 1. Split the line into words.
@@ -649,6 +686,40 @@ bool runCommand(DebugSession &s, const string &line, bool &quitRequested)
     //      help       -> printHelp
     //      quit, exit -> set quitRequested = true
     // 4. For anything else, or a wrong number of words, print "unknown command" and the help text, and return false.
+
+    vector<string> w = splitWords(line);
+    if (w.size() > 0 and w[0] == PROGRAM_NAME)
+        w.erase(w.begin());
+
+    if (w.size() == 2 and w[0] == "start")
+        return cmdStart(s, w[1]);
+    if (w.size() == 1 and w[0] == "next")
+        return cmdNext(s);
+    if (w.size() == 1 and w[0] == "prv")
+        return cmdPrv(s);
+    if (w.size() == 3 and w[0] == "jmp" and (w[1] == "next" or w[1] == "prv"))
+    {
+        int32_t n;
+        if (parseJump(w[2], n))
+        {
+            if (w[1] == "next")
+                return cmdJmpNext(s, n);
+            return cmdJmpPrv(s, n);
+        }
+    }
+    if (w.size() == 1 and w[0] == "help")
+    {
+        printHelp();
+        return true;
+    }
+    if (w.size() == 1 and (w[0] == "quit" or w[0] == "exit"))
+    {
+        quitRequested = true;
+        return true;
+    }
+    cout << "unknown command" << endl;
+    printHelp();
+    return false;
 }
 int main(int argc, char *argv[])
 {
@@ -662,4 +733,33 @@ int main(int argc, char *argv[])
     //
     // After the loop: closeSession(session) and return 0.
     // Never exit the loop because of an error. Only quit or the end of the input leaves it.
+
+    if (argc >= 3)
+    {
+        LB_HOST = argv[1];
+        LB_PORT = atoi(argv[2]);
+    }
+
+    DebugSession session;
+    initSession(session);
+
+    cout << "Time-Travel Debugger" << endl;
+    printHelp();
+
+    bool quitRequested = false;
+    string line;
+    while (true)
+    {
+        if (quitRequested)
+            break;
+        cout << PROMPT << flush;
+        if (!getline(cin, line))
+            break;
+        if (splitWords(line).size() == 0)
+            continue; // blank line, ignore
+        runCommand(session, line, quitRequested);
+    }
+
+    closeSession(session);
+    return 0;
 }
