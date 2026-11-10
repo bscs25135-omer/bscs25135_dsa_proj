@@ -11,6 +11,12 @@
 //   main loop -> readCommand -> runCommand
 //   start -> cmdStart()  -> requestDebugFile() (Part A) -> openTdbg() (Part B) -> shows step 1
 //   next, prv, jmp -> moveBy() (Part D) -> readSnapshotAt() (Part B) -> printSnapshot() (Part E)
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/select.h>
 
 #include <iostream>
 #include <string>
@@ -26,12 +32,13 @@
 using namespace std;
 
 // ---- Constants ----
+const int32_t MAX_NAME_LEN = 256;
 const char *PROGRAM_NAME = "ttdb";
 const char *PROMPT = "ttdb> ";
 const int IO_BUFFER_SIZE = 64 * 1024;     // fixed buffer for streaming files to and from the socket
 const char *TDBG_FILE = "ttdb_last.tdbg"; // where the downloaded .tdbg is saved
 const int MAX_JUMP = 1000000000;          // biggest n accepted by jmp
-string LB_HOST = "127.0.0.0";
+string LB_HOST = "127.0.0.1";
 int LB_PORT = 5000;
 
 // These two must be the same as in Phase 1
@@ -102,77 +109,111 @@ bool recvAll(int sock, char *buf, size_t n)
 }
 bool sendAll(int sock, const char *buf, size_t n)
 {
-    // send() can send fewer bytes than asked for, so keep calling it until all n bytes are sent.
-    // Use the flag MSG_NOSIGNAL. Return false if the connection fails.
-
     size_t sent = 0;
     while (sent < n)
     {
         ssize_t r = send(sock, buf + sent, n - sent, MSG_NOSIGNAL);
-        if (r <= 0)
-            return false;
-        sent = sent + r;
+        if (r < 0)
+        {
+            if (errno == EINTR)
+                continue;                                // interrupted — retry
+            if (errno == EAGAIN or errno == EWOULDBLOCK) // SO_SNDTIMEO fired
+                return false;
+            return false; // EPIPE / ECONNRESET / …
+        }
+        if (r == 0)
+            return false; // peer closed mid-send
+        sent += r;
     }
     return true;
 }
 
-bool parseIPv4(const char *text, unsigned char out[4])
-{
-    int part = 0;
-    int value = 0;
-    int digits = 0;
-    for (int i = 0;; i++)
-    {
-        char c = text[i];
-        if (c >= '0' and c <= '9')
-        {
-            value = value * 10 + (c - '0');
-            digits++;
-            if (digits > 3 or value > 255)
-                return false;
-        }
-        else if (c == '.' or c == '\0')
-        {
-            if (digits == 0)
-                return false;
-            if (part >= 4)
-                return false;
-            out[part] = (unsigned char)value;
-            part++;
-            value = 0;
-            digits = 0;
-            if (c == '\0')
-                break;
-        }
-        else
-            return false;
-    }
-    return part == 4;
-}
+// bool parseIPv4(const char *text, unsigned char out[4])
+// {
+//     int part = 0;
+//     int value = 0;
+//     int digits = 0;
+//     for (int i = 0;; i++)
+//     {
+//         char c = text[i];
+//         if (c >= '0' and c <= '9')
+//         {
+//             value = value * 10 + (c - '0');
+//             digits++;
+//             if (digits > 3 or value > 255)
+//                 return false;
+//         }
+//         else if (c == '.' or c == '\0')
+//         {
+//             if (digits == 0)
+//                 return false;
+//             if (part >= 4)
+//                 return false;
+//             out[part] = (unsigned char)value;
+//             part++;
+//             value = 0;
+//             digits = 0;
+//             if (c == '\0')
+//                 break;
+//         }
+//         else
+//             return false;
+//     }
+//     return part == 4;
+// }
 
 int connectToHost(const char *host, int port)
 {
-    // Create a TCP socket and connect it to host:port.
-    // Return the socket, or -1 if the connection fails.
-
-    unsigned char ip[4];
-    if (port < 1 or port > 65535 or !parseIPv4(host, ip))
+    if (port < 1 or port > 65535)
         return -1;
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0)
         return -1;
-    sockaddr addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sa_family = AF_INET;
-    addr.sa_data[0] = (char)((port >> 8) & 0xFF);
-    addr.sa_data[1] = (char)(port & 0xFF);
-    for (int i = 0; i < 4; i++)
-        addr.sa_data[2 + i] = (char)ip[i];
-    if (connect(s, &addr, sizeof(addr)) < 0)
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    int gr = getaddrinfo(host, nullptr, &hints, &res);
+    if (gr != 0)
     {
         close(s);
         return -1;
     }
+    addr.sin_addr = ((sockaddr_in *)res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+
+    int fl = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, fl | O_NONBLOCK);
+    int r = connect(s, (sockaddr *)&addr, sizeof(addr));
+    if (r < 0 and errno != EINPROGRESS)
+    {
+        close(s);
+        return -1;
+    }
+    if (r < 0)
+    {
+        fd_set ws;
+        FD_ZERO(&ws);
+        FD_SET(s, &ws);
+        timeval tv{10, 0}; // 10 s connect timeout
+        int sr = select(s + 1, nullptr, &ws, nullptr, &tv);
+        if (sr <= 0)
+        {
+            close(s);
+            return -1;
+        }
+        int e = 0;
+        socklen_t l = sizeof(e);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, &e, &l);
+        if (e != 0)
+        {
+            close(s);
+            return -1;
+        }
+    }
+    fcntl(s, F_SETFL, fl);
     return s;
 }
 bool uploadSource(int sock, const char *sourcePath)
@@ -190,7 +231,14 @@ bool uploadSource(int sock, const char *sourcePath)
     {
         size_t n = fread(buf, 1, IO_BUFFER_SIZE, f);
         if (n == 0)
+        {
+            if (ferror(f))
+            {
+                fclose(f);
+                return false;
+            }
             break;
+        }
         crc = crcUpdate(crc, buf, n);
         if (!sendAll(sock, buf, n))
         {
@@ -225,6 +273,17 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
     while (true)
     {
         ssize_t n = recv(sock, buf, IO_BUFFER_SIZE, 0);
+        if (n < 0 and (errno == EAGAIN or errno == EWOULDBLOCK))
+        {
+            if (fp != nullptr)
+            {
+                fclose(fp);
+                fp = nullptr;
+                remove(outTdbgPath);
+            }
+            outError = "timed out waiting for the server";
+            return false;
+        }
         if (n <= 0)
             break;
         int32_t r = chk.feed(buf, (int32_t)n, out);
@@ -245,7 +304,16 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
             }
         }
         if (status == 0 and fp != nullptr)
-            fwrite(out + start, 1, r - start, fp);
+        {
+            if (r - start > 0 and fwrite(out + start, 1, r - start, fp) != (size_t)(r - start))
+            {
+                fclose(fp);
+                fp = nullptr;
+                remove(outTdbgPath);
+                outError = "cannot write the .tdbg file (disk full?)";
+                return false;
+            }
+        }
         else if (status == 1)
         {
             for (int32_t i = start; i < r; i++)
@@ -293,6 +361,9 @@ bool requestDebugFile(const char *host, int port, const char *sourcePath, const 
         outError = "cannot connect to the load balancer at " + string(host) + ":" + to_string(port);
         return false;
     }
+    timeval tv{30, 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (!uploadSource(sock, sourcePath))
     {
         // the load balancer might have refused are request("server busy") so try reading its message
@@ -340,7 +411,7 @@ bool readInt(int fd, int32_t &v)
 }
 bool readStr(int fd, string &out)
 {
-    const int32_t maxLen = 4096;
+    const int32_t maxLen = MAX_NAME_LEN; // must match server
     int32_t len;
     if (!readInt(fd, len))
         return false;
@@ -390,6 +461,9 @@ bool readFrame(int fd, Frame &fr)
 /////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////
 
+// Top of the client file, next to the other constants:
+const int32_t MAX_STEPS_CLIENT = 5'000'000;
+
 bool openTdbg(const char *path, TdbgReader &r)
 {
     r.file_index = -1;
@@ -412,14 +486,27 @@ bool openTdbg(const char *path, TdbgReader &r)
         close(fd);
         return false;
     }
+
+    if (h.stepCount <= 0 or h.stepCount > MAX_STEPS_CLIENT)
+    {
+        close(fd);
+        return false;
+    }
+
     off_t fileSize = lseek(fd, 0, SEEK_END);
-    if (h.stepCount <= 0 or h.indexOffset < 20 or h.indexOffset + (int64_t)h.stepCount * 8 > fileSize)
+    if (fileSize < 0)
+    {
+        close(fd);
+        return false;
+    }
+    if (h.indexOffset < 20 or h.indexOffset + (int64_t)h.stepCount * 8 > (int64_t)fileSize)
     {
         close(fd);
         return false;
     }
 
     vector<int64_t> idx;
+    idx.reserve((size_t)h.stepCount); // now bounded by MAX_STEPS_CLIENT
     if (lseek(fd, (off_t)h.indexOffset, SEEK_SET) < 0)
     {
         close(fd);
@@ -558,7 +645,8 @@ bool cmdStart(DebugSession &s, const string &sourcePath)
         remove(tmp.c_str());
         return false;
     }
-    rename(tmp.c_str(), TDBG_FILE);
+    if (rename(tmp.c_str(), TDBG_FILE) != 0)
+        perror("rename ttdb_last.tdbg"); // non-fatal: the open fd keeps working
 
     if (s.active_flag)
         closeTdbg(s.reader);
@@ -688,35 +776,66 @@ bool runCommand(DebugSession &s, const string &line, bool &quitRequested)
     // 4. For anything else, or a wrong number of words, print "unknown command" and the help text, and return false.
 
     vector<string> w = splitWords(line);
-    if (w.size() > 0 and w[0] == PROGRAM_NAME)
+    if ((w.size() > 0) and (w[0] == PROGRAM_NAME))
+    {
         w.erase(w.begin());
+    }
+    if (w.empty())
+        return true; // bare "ttdb" — nothing to do  (also fixes L3)
 
-    if (w.size() == 2 and w[0] == "start")
+    if (w[0] == "start" and w.size() != 2)
+    {
+        cout << "usage: start <file>\n";
+        return false;
+    }
+    if ((w[0] == "next" or w[0] == "prv") and w.size() != 1)
+    {
+        cout << "usage: " << w[0] << "\n";
+        return false;
+    }
+    if (w[0] == "jmp" and w.size() != 3)
+    {
+        cout << "usage: jmp next|prv <n>\n";
+        return false;
+    }
+    if (w[0] == "jmp" and w.size() == 3 and w[1] != "next" and w[1] != "prv")
+    {
+        cout << "usage: jmp next|prv <n>\n";
+        return false;
+    }
+    if ((w.size() == 2) and (w[0] == "start"))
+    {
         return cmdStart(s, w[1]);
-    if (w.size() == 1 and w[0] == "next")
+    }
+    if ((w.size() == 1) and (w[0] == "next"))
+    {
         return cmdNext(s);
-    if (w.size() == 1 and w[0] == "prv")
+    }
+    if ((w.size() == 1) and (w[0] == "prv"))
+    {
         return cmdPrv(s);
-    if (w.size() == 3 and w[0] == "jmp" and (w[1] == "next" or w[1] == "prv"))
+    }
+    if ((w.size() == 3) and (w[0] == "jmp") and ((w[1] == "next") or (w[1] == "prv")))
     {
         int32_t n;
-        if (parseJump(w[2], n))
+        if (!parseJump(w[2], n))
         {
-            if (w[1] == "next")
-                return cmdJmpNext(s, n);
-            return cmdJmpPrv(s, n);
+            cout << "invalid jump: expected a positive number 1-" << MAX_JUMP << "\n";
+            return false;
         }
+        return (w[1] == "next") ? cmdJmpNext(s, n) : cmdJmpPrv(s, n);
     }
-    if (w.size() == 1 and w[0] == "help")
+    if ((w.size() == 1) and (w[0] == "help"))
     {
         printHelp();
         return true;
     }
-    if (w.size() == 1 and (w[0] == "quit" or w[0] == "exit"))
+    if ((w.size() == 1) and ((w[0] == "quit") or (w[0] == "exit")))
     {
         quitRequested = true;
         return true;
     }
+
     cout << "unknown command" << endl;
     printHelp();
     return false;
@@ -734,12 +853,21 @@ int main(int argc, char *argv[])
     // After the loop: closeSession(session) and return 0.
     // Never exit the loop because of an error. Only quit or the end of the input leaves it.
 
-    if (argc >= 3)
+    if (argc >= 2)
     {
         LB_HOST = argv[1];
-        LB_PORT = atoi(argv[2]);
     }
-
+    if (argc >= 3)
+    {
+        int p = atoi(argv[2]);
+        if (p >= 1 and p <= 65535)
+            LB_PORT = p;
+        else
+        {
+            cerr << "invalid port '" << argv[2] << "' (expected 1-65535)\n";
+            return 1;
+        }
+    }
     DebugSession session;
     initSession(session);
 

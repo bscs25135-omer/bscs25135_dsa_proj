@@ -6,7 +6,6 @@
 //   2. Pass 0X1   -- resolve(): copy EVERY source line into resolve.bin as [offset][size][string], then patch CALL targets.
 //   3. Pass 0X2   -- execute resolve.bin: tokenize ONE line at a time, update the call stack, take a snapshot -> Timeline
 //   4. Pass 0X3   -- serialize Timeline -> session.tdbg(header + snapshot records + dense index)
-
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -26,6 +25,7 @@
 using namespace std;
 
 // ---- Constants ----
+const int32_t MAX_NAME_LEN = 256; // shared by server + client
 const int32_t MAX_VARS_PER_FRAME = 16;
 const int32_t MAX_STACK_DEPTH = 64;
 const int32_t MAX_FUNCS = 128;
@@ -34,7 +34,7 @@ const int32_t MAX_PATCHES = MAX_FUNCS * 4;
 const uint64_t MAX_SOURCE_BYTES = 15ULL * 1024 * 1024; // sanity cap on the declared file length
 const int32_t IO_BUFFER_SIZE = 64 * 1024;              // fixed buffer for streaming to/from disk
 const int32_t SOCKET_TIMEOUT_SEC = 5;                  // TODO: apply as SO_RCVTIMEO so a deadclient can't hang the server forever
-
+const int64_t MAX_STEPS = 5'000'000;
 // ---- Custom data structures
 
 // Stack: back the live Call Stack during execution
@@ -468,6 +468,11 @@ int32_t tokenizeLine(const string &line, Token tokens[], int32_t maxTokens)
         {
             w += line[i];
             i++;
+            if ((int32_t)w.size() > MAX_NAME_LEN)
+            {
+                cerr << "error: token longer than " << MAX_NAME_LEN << " characters\n";
+                return 0; // 0 tokens → caller skips the line
+            }
         }
         tokens[n].text = w;
         if (n == 0)
@@ -533,8 +538,13 @@ Variable *findVar(Frame &fr, const string &n)
     }
     return nullptr;
 }
-Variable *getVar(Frame &fr, const string &n) // find, or create as a local = 0
+Variable *getVar(Frame &fr, const string &n)
 {
+    if ((int32_t)n.size() > MAX_NAME_LEN)
+    {
+        cerr << "error: identifier '" << n.substr(0, 32) << "...' too long\n";
+        return nullptr;
+    }
     Variable *v = findVar(fr, n);
     if (v != nullptr)
         return v;
@@ -578,8 +588,14 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
     Token t[MAX_TOKENS];
     fseek(f, (long)mainOffset, SEEK_SET);
     readResolveRecord(f, l);
+    int64_t produced = 0;
     while (not st.isEmpty())
     {
+        if (produced >= MAX_STEPS)
+        {
+            cerr << "error: too many steps (limit " << MAX_STEPS << ")\n";
+            break;
+        }
         int64_t pos = ftell(f);
         int64_t off = readResolveRecord(f, l);
         if (off < 0)
@@ -674,6 +690,7 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
         else
             cerr << "warning: unknown instruction '" << kw << "'\n";
         timeline.record(buildSnapshot(st));
+        ++produced;
     }
     fclose(f);
 }
@@ -760,8 +777,14 @@ bool sendAll(int sock, const char *buf, size_t n)
     while (sent < n)
     {
         ssize_t r = send(sock, buf + sent, n - sent, MSG_NOSIGNAL);
-        if (r <= 0)
-            return false;
+        if (r < 0)
+        {
+            if (errno == EINTR)
+                continue; // interrupted by a signal — retry
+            return false; // EPIPE / ECONNRESET / …
+        }
+        if (r == 0)
+            return false; // peer closed mid-send
         sent += r;
     }
     return true;
@@ -874,6 +897,8 @@ bool receiveSource(int sock, const char *path, string &err)
             break; // client finished sending
         if (n < 0)
         {
+            if (errno == EINTR)
+                continue;
             err = "connection broke or timed out while receiving your code";
             ok = false;
             break;
@@ -906,53 +931,70 @@ bool receiveSource(int sock, const char *path, string &err)
 
 void handleClient(int cs)
 {
-    string err;
-    if (!receiveSource(cs, "source.bin", err))
+    try
     {
-        sendErrorReply(cs, err);
-        return;
-    }
-    remove("session.tdbg"); // no send stale file
-
-    // passes print errors to cerr: send those to a file so we can forward them
-    ofstream errFile("errors.txt");
-    streambuf *oldBuf = cerr.rdbuf(errFile.rdbuf());
-
-    Timeline timeline;
-    bool good = false;
-    if (validateProgram("source.bin"))
-    {
-        int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
-        if (mainOffset >= 0)
+        string err;
+        if (!receiveSource(cs, "source.bin", err))
         {
-            executeProgram("resolve.bin", mainOffset, timeline);
-            if (timeline.getStepCount() > 0)
+            sendErrorReply(cs, err);
+            return;
+        }
+        remove("session.tdbg"); // no send stale file
+
+        // passes print errors to cerr: send those to a file so we can forward them
+        ofstream errFile("errors.txt");
+        streambuf *oldBuf = cerr.rdbuf(errFile.rdbuf());
+
+        Timeline timeline;
+        bool good = false;
+        if (validateProgram("source.bin"))
+        {
+            int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
+            if (mainOffset >= 0)
             {
-                writeTdbg(timeline, "session.tdbg");
-                good = true;
+                executeProgram("resolve.bin", mainOffset, timeline);
+                if (timeline.getStepCount() > 0)
+                {
+                    writeTdbg(timeline, "session.tdbg");
+                    good = true;
+                }
             }
         }
-    }
-    cerr.rdbuf(oldBuf);
-    errFile.close();
+        cerr.rdbuf(oldBuf);
+        errFile.close();
 
-    if (!good)
-    {
-        string m = "";
-        ifstream ein("errors.txt");
-        string line;
-        while (getline(ein, line))
         {
-            if (m.size() > 0)
-                m += "\n";
-            m += line;
+            ifstream ein("errors.txt");
+            string line;
+            while (getline(ein, line))
+                std::cerr << "[run] " << line << "\n";
         }
-        if (m.size() == 0)
-            m = "program produced no steps";
-        sendErrorReply(cs, m);
-        return;
+        if (!good)
+        {
+            string m = "";
+            ifstream ein("errors.txt");
+            string line;
+            while (getline(ein, line))
+            {
+                if (m.size() > 0)
+                    m += "\n";
+                m += line;
+            }
+            if (m.size() == 0)
+                m = "program produced no steps";
+            sendErrorReply(cs, m);
+            return;
+        }
+        sendFileReply(cs, "session.tdbg");
     }
-    sendFileReply(cs, "session.tdbg");
+    catch (const std::bad_alloc &)
+    {
+        sendErrorReply(cs, "server ran out of memory");
+    }
+    catch (const std::exception &e)
+    {
+        sendErrorReply(cs, std::string("internal error: ") + e.what());
+    }
 }
 
 /////////////////////////////////////////////////////////////

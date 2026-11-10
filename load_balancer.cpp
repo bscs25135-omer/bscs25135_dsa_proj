@@ -1,7 +1,7 @@
 // ======================= TIME-TRAVEL DEBUGGER - LOAD BALANCER TEMPLATE =======================
 
 // What load balancer does:
-//   1. Many clients can connect at the same time. Each one sends one string (the source code). 
+//   1. Many clients can connect at the same time. Each one sends one string (the source code).
 //   2. Clients wait in a queue (first come, first served).
 //   3. For each client, in order: make sure the server is running (start it with system() if not),
 //      pass the string to the server, pass the server's reply back to the client.
@@ -21,9 +21,9 @@
 // What the server program must do (the load balancer depends on this):
 //   - it takes its port as the first argument, for example: ./server 5001
 //   - it reads the string until the connection's write side is closed (recv returns 0)
-//   - it sends its reply as [status: 1 byte][payload], then closes the connection 
+//   - it sends its reply as [status: 1 byte][payload], then closes the connection
 
-
+#define _GNU_SOURCE
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -33,23 +33,24 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h> // <-- for struct timeval (SO_RCVTIMEO)
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "helper.h"
+#include <cerrno>
+#include <poll.h>
 using namespace std;
 
-
 // ---- Constants ----
-const char *SERVER_PATH = "./server";      // the program we start when the server is down
-const int IO_BUFFER_SIZE = 64 * 1024;      // fixed buffer for moving bytes
-const int LISTEN_BACKLOG = 16;             // connections the OS holds until accept() takes them
-const int MAX_PENDING_CLIENTS = 8;         // clients allowed to wait in our queue. More than this get "server busy".
-const int STARTUP_MAX_ATTEMPTS = 50;       // after starting the server, how many times we try to connect
-const int STARTUP_POLL_INTERVAL_MS = 100;  // wait between those tries (50 x 100 ms = 5 seconds in total)
+const char *SERVER_PATH = "./server";     // the program we start when the server is down
+const int IO_BUFFER_SIZE = 64 * 1024;     // fixed buffer for moving bytes
+const int LISTEN_BACKLOG = 16;            // connections the OS holds until accept() takes them
+const int MAX_PENDING_CLIENTS = 8;        // clients allowed to wait in our queue. More than this get "server busy".
+const int STARTUP_MAX_ATTEMPTS = 50;      // after starting the server, how many times we try to connect
+const int STARTUP_POLL_INTERVAL_MS = 100; // wait between those tries (50 x 100 ms = 5 seconds in total)
 int lbPort = 5000;
-string serverHost = "127.0.0.0";
+string serverHost = "127.0.0.1";
 int serverPort = 5001;
-
 
 // ---- Queue: here it holds client sockets (int). ----
 // Implement it yourself, do not use std::queue.
@@ -64,33 +65,44 @@ class Queue
     Node *front, *rear;
     int count;
 
-
 public:
     // Implement these functions:
-    Queue() { front = nullptr; rear = nullptr; count = 0; }
-    ~Queue() {
-        while (front != nullptr) {
-         Node *n = front;
-         front = front->next;
-         delete n; }
+    Queue()
+    {
+        front = nullptr;
+        rear = nullptr;
+        count = 0;
+    }
+    ~Queue()
+    {
+        while (front != nullptr)
+        {
+            Node *n = front;
+            front = front->next;
+            delete n;
         }
+    }
     void enqueue(const T &val)
     {
         Node *n = new Node;
         n->data = val;
         n->next = nullptr;
-        if (rear != nullptr) rear->next = n;
-        else front = n;
+        if (rear != nullptr)
+            rear->next = n;
+        else
+            front = n;
         rear = n;
         count++;
     }
     T dequeue()
     {
-        if (front == nullptr) return T();
+        if (front == nullptr)
+            return T();
         Node *n = front;
         T v = n->data;
         front = n->next;
-        if (front == nullptr) rear = nullptr;
+        if (front == nullptr)
+            rear = nullptr;
         delete n;
         count--;
         return v;
@@ -101,10 +113,10 @@ public:
 
 struct ClientInfo
 {
-    int sock;           // the connected socket
-    string address;     // the client's IP as text, e.g. "127.0.0.1"
-    int port;           // the client's port
-    time_t arrivedAt;   // when accept() returned
+    int sock;         // the connected socket
+    string address;   // the client's IP as text, e.g. "127.0.0.1"
+    int port;         // the client's port
+    time_t arrivedAt; // when accept() returned
 };
 
 // The queue is used by two threads, so every use of it must be inside queueMutex.
@@ -112,9 +124,8 @@ Queue<ClientInfo> pendingClients;
 mutex queueMutex;
 sig_atomic_t flag = 1;
 
-
 // ---- Basic socket helpers ----
-bool sendAll(int sock, const char *buf, size_t n) 
+bool sendAll(int sock, const char *buf, size_t n)
 {
     // Reply format: [status: 1 byte][sending_material][checksum: 4 bytes].
     // send() may send fewer bytes than asked for, so keep calling it until all n bytes are sent.
@@ -122,35 +133,53 @@ bool sendAll(int sock, const char *buf, size_t n)
     while (sent < n)
     {
         ssize_t r = send(sock, buf + sent, n - sent, MSG_NOSIGNAL);
-        if (r < 0) { if (errno == EINTR) continue; return false; }
-        if (r == 0) return false;
+        if (r < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (r == 0)
+            return false;
         sent = sent + r;
     }
     return true;
-    
 }
 bool sendError(int sock, const string &message)
 {
-    // Reply format: [status: 1 byte][payload until close][checksum: 4 bytes].
-    // For an error: send one byte with value 1, then the message text.
-    string out = "";
+    string out;
     out += (char)1;
     out += message;
     uint32_t c = crcOf(out.c_str(), out.size());
     char t[4];
     putU32(t, c);
-    for (int i = 0; i < 4; i++) out += t[i];
-    return sendAll(sock, out.c_str(), out.size());
+    for (int i = 0; i < 4; i++)
+        out += t[i];
+    bool ok = sendAll(sock, out.c_str(), out.size());
+
+    shutdown(sock, SHUT_WR);
+
+    timeval tv{2, 0}; // cap the drain at 2 s total
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char drain[4096];
+    while (recv(sock, drain, sizeof(drain), 0) > 0)
+    { /* discard */
+    }
+    return ok;
 }
 int createListenSocket(int port)
-{ 
+{
     // Create a TCP socket with SOCK_CLOEXEC(flag).
     // set SO_REUSEADDR so we can restart the load balancer right away.
     // bind() to the port on any address, then listen(LISTEN_BACKLOG).
     // If bind or listen fails, print the error and exit, because without this socket we cannot work.
 
     int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0) { perror("socket"); exit(1); }
+    if (s < 0)
+    {
+        perror("socket");
+        exit(1);
+    }
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     sockaddr_in addr;
@@ -158,8 +187,16 @@ int createListenSocket(int port)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
-    if (bind(s, (sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); exit(1); }
-    if (listen(s, LISTEN_BACKLOG) < 0) { perror("listen"); exit(1); }
+    if (bind(s, (sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        perror("bind");
+        exit(1);
+    }
+    if (listen(s, LISTEN_BACKLOG) < 0)
+    {
+        perror("listen");
+        exit(1);
+    }
     return s;
 }
 int connectToServer(const char *host, int port)
@@ -168,20 +205,28 @@ int connectToServer(const char *host, int port)
     // Return the socket, or -1 if the connection fails
 
     int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0) return -1;
+    if (s < 0)
+        return -1;
     sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) { close(s); return -1; }  // text IP -> binary
-    if (connect(s, (sockaddr *)&addr, sizeof(addr)) < 0) { close(s); return -1; }
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1)
+    {
+        close(s);
+        return -1;
+    } // text IP -> binary
+    if (connect(s, (sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        close(s);
+        return -1;
+    }
     return s;
 }
 
 // =============================================================================================
 // PART 1: WAKING UP THE SERVER IF IT IS DOWN
 // =============================================================================================
-
 
 bool startServer(int port)
 {
@@ -192,33 +237,32 @@ bool startServer(int port)
 
     string cmd = string(SERVER_PATH) + " " + to_string(port) + " &";
     return system(cmd.c_str()) == 0;
-
 }
 int connectToServerWithWakeup()
 {
     // 1. Try connectToServer(). If it works, return that socket. The server is alive.
     // 2. Otherwise call startServer(). If it fails, return -1.
-    // 3. Try connectToServer() up to STARTUP_MAX_ATTEMPTS times 
+    // 3. Try connectToServer() up to STARTUP_MAX_ATTEMPTS times
     // 4. Return the first working socket, or -1 if the server never came up.
 
     int s = connectToServer(serverHost.c_str(), serverPort);
-    if (s >= 0) return s;
-    if (!startServer(serverPort)) return -1;
+    if (s >= 0)
+        return s;
+    if (!startServer(serverPort))
+        return -1;
     for (int i = 0; i < STARTUP_MAX_ATTEMPTS; i++)
     {
         usleep(STARTUP_POLL_INTERVAL_MS * 1000);
         s = connectToServer(serverHost.c_str(), serverPort);
-        if (s >= 0) return s;
+        if (s >= 0)
+            return s;
     }
     return -1;
-
 }
-
 
 // =============================================================================================
 // PART 2: PASSING THE STRING AND THE REPLY (one client, called by the main thread only)
 // =============================================================================================
-
 
 void relayOneClient(ClientInfo &c)
 {
@@ -233,61 +277,102 @@ void relayOneClient(ClientInfo &c)
 
     int serverSock = connectToServerWithWakeup();
 
-    if (serverSock < 0) { sendError(c.sock, "backend server failed to start"); close(c.sock); return; }
+    if (serverSock < 0)
+    {
+        sendError(c.sock, "backend server failed to start");
+        close(c.sock);
+        return;
+    }
 
     char buf[IO_BUFFER_SIZE];
     bool ok = true;
     while (true)
     {
         ssize_t n = recv(c.sock, buf, IO_BUFFER_SIZE, 0);
-        if (n == 0) break;
-        if (n < 0) { if (errno == EINTR){ continue; ok = false; break; }}
-        if (!sendAll(serverSock, buf, n)) { ok = false; break; }
+        if (n == 0)
+            break;
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            ok = false;
+            break;
+        }
+        if (!sendAll(serverSock, buf, n))
+        {
+            ok = false;
+            break;
+        }
     }
-    if (!ok) { sendError(c.sock, "connection broke while passing your code to the server");
-               close(serverSock); close(c.sock); return; }
+    if (!ok)
+    {
+        sendError(c.sock, "connection broke while passing your code to the server");
+        close(serverSock);
+        close(c.sock);
+        return;
+    }
     shutdown(serverSock, SHUT_WR);
 
     long total = 0;
     while (true)
     {
         ssize_t n = recv(serverSock, buf, IO_BUFFER_SIZE, 0);
-        if (n == 0) break;
-        if (n < 0) { if (errno == EINTR) continue; break; }
-        if (!sendAll(c.sock, buf, n)) break;
+        if (n == 0)
+            break;
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (!sendAll(c.sock, buf, n))
+            break;
         total = total + n;
     }
-    if (total == 0) sendError(c.sock, "server closed the connection without replying");
+    if (total == 0)
+        sendError(c.sock, "server closed the connection without replying");
     close(serverSock);
     close(c.sock);
 }
-
 
 // =============================================================================================
 // PART 3: THE TWO THREADS
 // =============================================================================================
 
-
 void acceptLoop(int listenSock)
 {
-    // Repeat: accept() a new client. 
-    //  If pendingClients.size() is already MAX_PENDING_CLIENTS: unlock, sendError "server busy, try again later",
-    // else
-    // Lock queueMutex.
-    //   close the client, and go on.
-    //   Otherwise enqueue the client socket.
-    // Never wait for the server here, so new clients are always accepted quickly.
-    // If accept() fails, print the error and keep going (do not end the thread).
-
     while (flag)
     {
+        pollfd pfd{listenSock, POLLIN, 0};
+        int pr = poll(&pfd, 1, 200); // wake up every 200 ms
+        if (!flag)
+            break;
+        if (pr < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            perror("poll");
+            break;
+        }
+        if (pr == 0)
+            continue; // timeout — recheck flag
+
         sockaddr_in ca;
         socklen_t len = sizeof(ca);
         int cs = accept4(listenSock, (sockaddr *)&ca, &len, SOCK_CLOEXEC);
-        if (cs < 0) { perror("accept"); usleep(100000); continue; }
+        if (cs < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            perror("accept");
+            continue;
+        }
+
         ClientInfo c;
-        c.sock = cs; c.address = inet_ntoa(ca.sin_addr);
-        c.port = ntohs(ca.sin_port); c.arrivedAt = time(nullptr);
+        c.sock = cs;
+        c.address = inet_ntoa(ca.sin_addr);
+        c.port = ntohs(ca.sin_port);
+        c.arrivedAt = time(nullptr);
 
         queueMutex.lock();
         if (pendingClients.size() >= MAX_PENDING_CLIENTS)
@@ -302,7 +387,6 @@ void acceptLoop(int listenSock)
             queueMutex.unlock();
         }
     }
-
 }
 void dispatcherLoop()
 {
@@ -316,34 +400,42 @@ void dispatcherLoop()
         ClientInfo c;
         bool got = false;
         queueMutex.lock();
-        if (!pendingClients.isEmpty()) { c = pendingClients.dequeue(); got = true; }
+        if (!pendingClients.isEmpty())
+        {
+            c = pendingClients.dequeue();
+            got = true;
+        }
         queueMutex.unlock();
-        if (got) relayOneClient(c);
-        else usleep(10000);
+        if (got)
+            relayOneClient(c);
+        else
+            usleep(10000);
     }
-
 }
 
-void handler(int sg) {
+void handler(int sg)
+{
     (void)sg;
     flag = 0;
 }
 int main(int argc, char *argv[])
 {
 
-    (void)argc;
-    (void)argv;
+    if (argc >= 2)
+    {
+        int p = atoi(argv[1]);
+        if (p >= 1 and p <= 65535)
+        {
+            lbPort = p;
+        }
+    }
 
-    signal(SIGINT, handler); // whenever ctrl+c will be pressed to exit the program the flag wll be set so insead of using infinite loop you can loop on flag to safely close things and exit
-    // 2. listenSock = createListenSocket(LB_PORT).
-    // 3. Start a thread that runs acceptLoop(listenSock) and detach it.
-    // 4. Call dispatcherLoop().
-
+    signal(SIGINT, handler);
+    signal(SIGTERM, handler); // also handles systemd / kill
     int listenSock = createListenSocket(lbPort);
     thread acceptor(acceptLoop, listenSock);
-    acceptor.detach();
-    dispatcherLoop();
+    dispatcherLoop(); // returns when flag == 0
     close(listenSock);
-
+    acceptor.join(); // poll timeout (200 ms) bounds the wait
     return 0;
 }

@@ -20,3 +20,4 @@
 - there were many errors and mistakes throughout and repition of code so i cleaned all that
 - split helper into .cpp and .h
 - now am stress testing and just testing in general to look for some missed mistakes or something
+- reinforced and catered some edge cases hopefully it wont fail or crash
