@@ -14,3 +14,6 @@
 - made commentary changes to `load_balancer`
 - added ipv4 parsing
 - worked on client side late at night and completed most of it up to part e
+
+## nov 10, 2026
+- added servers network wrapper and some issues are there so i am trying to resolve those
