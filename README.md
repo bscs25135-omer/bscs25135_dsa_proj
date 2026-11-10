@@ -21,3 +21,4 @@
 - split helper into .cpp and .h
 - now am stress testing and just testing in general to look for some missed mistakes or something
 - reinforced and catered some edge cases hopefully it wont fail or crash
+- added a stress test python script

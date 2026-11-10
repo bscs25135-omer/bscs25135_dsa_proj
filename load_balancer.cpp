@@ -23,7 +23,9 @@
 //   - it reads the string until the connection's write side is closed (recv returns 0)
 //   - it sends its reply as [status: 1 byte][payload], then closes the connection
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <iostream>
 #include <string>
 #include <cstring>
