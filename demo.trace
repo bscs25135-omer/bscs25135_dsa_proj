@@ -1,0 +1,11 @@
+func main
+set x 0
+set y 10
+call add_two x
+set z 99
+func_end
+
+func add_two a
+set a 5
+add a 3
+func_end

@@ -17,3 +17,6 @@
 
 ## nov 10, 2026
 - added servers network wrapper and some issues are there so i am trying to resolve those
+- there were many errors and mistakes throughout and repition of code so i cleaned all that
+- split helper into .cpp and .h
+- now am stress testing and just testing in general to look for some missed mistakes or something
